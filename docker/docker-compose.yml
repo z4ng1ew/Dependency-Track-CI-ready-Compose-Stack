@@ -1,0 +1,127 @@
+version: '3.8'
+
+services:
+  # База данных PostgreSQL с улучшенной конфигурацией
+  postgres:
+    image: postgres:15-alpine
+    container_name: dt-postgres
+    environment:
+      # Основные настройки базы данных
+      - POSTGRES_USER=dtrack
+      - POSTGRES_PASSWORD=dtrack
+      - POSTGRES_DB=dtrack
+      # Настройки инициализации с правильным encoding
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+      # Настройки производительности для улучшения стабильности
+      - POSTGRES_SHARED_PRELOAD_LIBRARIES=pg_stat_statements
+    volumes:
+      # Используем именованный volume для данных
+      - postgres_data:/var/lib/postgresql/data
+      # Добавляем tmpfs для временных файлов (улучшает производительность)
+      - /tmp
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    # Улучшенный health check с более мягкими условиями
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dtrack -d dtrack -h localhost"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # Ограничения ресурсов для предотвращения OOM
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # API сервер Dependency Track с расширенной конфигурацией
+  dtrack-apiserver:
+    image: dependencytrack/apiserver:latest
+    container_name: dt-apiserver
+    environment:
+      # Настройки подключения к базе данных
+      - ALPINE_DATABASE_MODE=external
+      - ALPINE_DATABASE_URL=jdbc:postgresql://postgres:5432/dtrack?useSSL=false&allowPublicKeyRetrieval=true
+      - ALPINE_DATABASE_DRIVER=org.postgresql.Driver
+      - ALPINE_DATABASE_USERNAME=dtrack
+      - ALPINE_DATABASE_PASSWORD=dtrack
+      
+      # Настройки пула соединений с базой данных
+      - ALPINE_DATABASE_POOL_ENABLED=true
+      - ALPINE_DATABASE_POOL_MAX_SIZE=20
+      - ALPINE_DATABASE_POOL_MIN_IDLE=10
+      - ALPINE_DATABASE_POOL_IDLE_TIMEOUT=300000
+      - ALPINE_DATABASE_POOL_MAX_LIFETIME=600000
+      
+      # JVM настройки - соответствуют минимальным требованиям Dependency-Track
+      - JAVA_OPTS=-Xms2g -Xmx4g -XX:+UseG1GC -XX:+UseStringDeduplication -XX:MaxMetaspaceSize=512m
+      
+      # Дополнительные настройки для стабильности
+      - ALPINE_APPLICATION_NAME=Dependency Track
+      - ALPINE_DATA_DIRECTORY=/data
+      
+      # Настройки логирования
+      - LOGGING_LEVEL=INFO
+      
+    volumes:
+      # Volume для данных приложения
+      - dtrack_data:/data
+    ports:
+      - "8081:8080"
+    # Жесткая зависимость от здоровой базы данных
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    # Собственный health check для API server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/api/version || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s  # Даем 2 минуты на инициализацию
+    # Ограничения ресурсов - увеличены для соответствия требованиям приложения
+    deploy:
+      resources:
+        limits:
+          memory: 5G  # 4GB для heap + дополнительная память для JVM overhead
+        reservations:
+          memory: 2G
+
+  # Фронтенд Dependency Track
+  dtrack-frontend:
+    image: dependencytrack/frontend:latest
+    container_name: dt-frontend
+    environment:
+      # URL API сервера (важно: используем внутреннее имя контейнера)
+      - API_BASE_URL=http://localhost:8081
+    ports:
+      - "8080:8080"
+    # Зависит от здорового API сервера
+    depends_on:
+      dtrack-apiserver:
+        condition: service_healthy
+    restart: unless-stopped
+    # Health check для фронтенда
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# Определение volumes - используем стандартные Docker volumes для простоты
+volumes:
+  postgres_data:
+    driver: local
+  dtrack_data:
+    driver: local
+
+# Настройки сети для изоляции сервисов
+networks:
+  default:
+    name: dependency-track-network
+    driver: bridge
